@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping, TypeVar
 from railforge.audit.trail import Trail
 from railforge.braking.brake_percentage import brake_percentage
 from railforge.billing.demurrage import charge
+from railforge.compensation.engine import QualityCompensationEngine
 from railforge.cargo.segregation import violations
 from railforge.consist.integrity import validate
 from railforge.customs.holds import active
@@ -62,10 +63,12 @@ class RailForgeWorkflowControl:
     """Atomic domain -> event -> audit workflow used by every feature surface."""
 
     def __init__(self, stream: EventStream | None = None, trail: Trail | None = None,
-                 store: VersionedStore | None = None):
+                 store: VersionedStore | None = None,
+                 compensation: QualityCompensationEngine | None = None):
         self.stream = stream or EventStream()
         self.trail = trail or Trail()
         self.store = store or VersionedStore()
+        self.compensation = compensation or QualityCompensationEngine(self.trail)
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
 
@@ -187,4 +190,22 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
+
+    def auto_compensate(self, operation_id, claim_id, account, observations, max_lateness,
+                        arrival, release, tariff, level, basis_revision, at,
+                        zone="UTC", expected_version=None):
+        """Freight service-quality compensation: ETA fusion -> cross-midnight
+        detention -> service-level credit -> reversal-safe ledger -> audit.
+
+        Observation revisions are applied by negating the prior basis first, so
+        a late revision never pays twice. The optimistic version check makes a
+        concurrent conflict replayable; callers re-settle against the new
+        version and every amount is re-derived identically.
+        """
+        def action():
+            return self.compensation.settle(
+                claim_id, account, observations, max_lateness, arrival, release,
+                tariff, level, basis_revision, at, zone=zone,
+                expected_version=expected_version)
+        return self._commit(operation_id, "quality.compensation.settled", claim_id, at, action)
 

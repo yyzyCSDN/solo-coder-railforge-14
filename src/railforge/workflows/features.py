@@ -146,3 +146,11 @@ class RailForgeFeatureService:
             return {"accepted": accepted, "delay": fused_delay(observations, max_lateness)}
         return self.control.run(operation_id, "feature.timeline.reconciled", operation_id, at, action)
 
+    def auto_compensate(self, operation_id, claim_id, account, observations, max_lateness,
+                        arrival, release, tariff, level, basis_revision, at,
+                        zone="UTC", expected_version=None):
+        return self.control.auto_compensate(
+            operation_id, claim_id, account, observations, max_lateness, arrival,
+            release, tariff, level, basis_revision, at, zone=zone,
+            expected_version=expected_version)
+
