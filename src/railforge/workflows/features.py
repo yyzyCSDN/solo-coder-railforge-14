@@ -14,6 +14,7 @@ from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.planning.loco_circulation import circulate
 from railforge.planning.train_path_engine import build, section_load, train_delay
 from railforge.routing.clearance import route_ok
+from railforge.service_quality.compensation import CompensationRequest, assess
 from railforge.signaling.block_occupancy import conflicts as block_conflicts
 from railforge.yard.hump import classify
 from railforge.yard.switching import lock_route
@@ -131,12 +132,91 @@ class RailForgeFeatureService:
             return {"wagons": selected, "cycle": cycle}
         return self.control.run(operation_id, "feature.wagons.repositioned", operation_id, at, action)
 
-    def calculate_compensation(self, operation_id, arrival, release, tariff, claim_case, claim_steps, at):
-        from railforge.billing.demurrage import charge
+    def calculate_compensation(self, operation_id, arrival=None, release=None, tariff=None,
+                               claim_case=None, claim_steps=None, at=None, *,
+                               request: CompensationRequest | None = None,
+                               shipment_id: str | None = None,
+                               service_level=None,
+                               observations=None,
+                               max_lateness=None,
+                               expected_version: int | None = None,
+                               expected_ledger_version: int | None = None):
+        from datetime import timedelta
+        from decimal import Decimal
         from railforge.customer.claims import ready
+        from railforge.customer.service_level import ServiceLevel
+
+        def build_request():
+            if request is not None:
+                overrides = (
+                    arrival, release, tariff, claim_case, claim_steps, at,
+                    shipment_id, service_level, observations, max_lateness,
+                )
+                if any(v is not None for v in overrides):
+                    raise ValueError("do not mix compensation request with legacy arguments")
+                return request
+            if arrival is None or release is None or tariff is None:
+                raise ValueError("arrival, release and tariff are required")
+            legacy_level = ServiceLevel(
+                "legacy",
+                timedelta.max,
+                Decimal("0"),
+            )
+            effective_level = service_level or legacy_level
+            event_at = at if at is not None else release
+            return CompensationRequest(
+                shipment_id=shipment_id or operation_id,
+                arrival=arrival,
+                release=release,
+                tariff=tariff,
+                service_level=effective_level,
+                observations=list(observations or []),
+                max_lateness=max_lateness or timedelta(hours=1),
+                claim_case=claim_case,
+                claim_steps=list(claim_steps or []),
+                at=event_at,
+            )
+
+        compensation_request = build_request()
+        automatic_inputs = request is not None or service_level is not None or observations is not None
+        legacy_claim_ready = ready(claim_case, claim_steps or []) if claim_case is not None else []
+
         def action():
-            return {"demurrage": charge(arrival, release, tariff), "claim_ready": ready(claim_case, claim_steps)}
-        return self.control.run(operation_id, "feature.compensation.calculated", operation_id, at, action)
+            assessment = assess(compensation_request)
+            posted = self.control.service_quality_ledger.post(
+                assessment, expected_version, expected_ledger_version,
+            )
+            transaction = posted.transaction
+            entries = tuple(posting.__dict__ for posting in transaction.postings) if transaction else ()
+            return {
+                "shipment_id": assessment.shipment_id,
+                "demurrage": assessment.demurrage,
+                "credit": assessment.credit,
+                "net_credit": posted.net_credit,
+                "fused_delay_minutes": assessment.fused_delay_minutes,
+                "late": assessment.late,
+                "eligible": assessment.eligible,
+                "pending_claim_steps": list(assessment.pending_claim_steps),
+                "claim_ready": (
+                    legacy_claim_ready
+                    if not automatic_inputs else not assessment.pending_claim_steps
+                ),
+                "fingerprint": assessment.fingerprint,
+                "status": posted.status,
+                "shipment_version": posted.shipment_version,
+                "ledger_version": posted.ledger_version,
+                "revision": posted.revision,
+                "transaction_id": transaction.transaction_id if transaction else None,
+                "entries": entries,
+                # Backward-compatible aliases for the original public workflow.
+                "claim_pending": (
+                    legacy_claim_ready
+                    if not automatic_inputs else list(assessment.pending_claim_steps)
+                ),
+            }
+        return self.control.run(operation_id, "feature.compensation.calculated",
+                                compensation_request.shipment_id,
+                                compensation_request.at or compensation_request.release, action)
 
     def timeline(self, operation_id, events, observations, max_lateness, at):
         def action():

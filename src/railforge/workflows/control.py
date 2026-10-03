@@ -22,6 +22,7 @@ from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import reserve
+from railforge.service_quality.ledger import ServiceQualityLedger
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
 from railforge.wagon.axle_load import route_ok as axle_route_ok
@@ -62,10 +63,12 @@ class RailForgeWorkflowControl:
     """Atomic domain -> event -> audit workflow used by every feature surface."""
 
     def __init__(self, stream: EventStream | None = None, trail: Trail | None = None,
-                 store: VersionedStore | None = None):
+                 store: VersionedStore | None = None,
+                 service_quality_ledger: ServiceQualityLedger | None = None):
         self.stream = stream or EventStream()
         self.trail = trail or Trail()
         self.store = store or VersionedStore()
+        self.service_quality_ledger = service_quality_ledger or ServiceQualityLedger(self.trail)
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
 
